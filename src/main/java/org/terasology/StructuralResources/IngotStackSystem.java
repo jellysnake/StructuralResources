@@ -25,12 +25,7 @@ import org.terasology.entitySystem.systems.BaseComponentSystem;
 import org.terasology.entitySystem.systems.RegisterSystem;
 import org.terasology.logic.characters.events.AttackEvent;
 import org.terasology.logic.common.ActivateEvent;
-import org.terasology.logic.inventory.InventoryManager;
-import org.terasology.logic.inventory.InventoryUtils;
-import org.terasology.logic.inventory.SelectedInventorySlotComponent;
-import org.terasology.logic.inventory.events.BeforeItemPutInInventory;
-import org.terasology.logic.inventory.events.InventorySlotChangedEvent;
-import org.terasology.logic.inventory.events.InventorySlotStackSizeChangedEvent;
+import org.terasology.logic.inventory.events.MoveItemEvent;
 import org.terasology.logic.location.LocationComponent;
 import org.terasology.logic.players.LocalPlayer;
 import org.terasology.math.ChunkMath;
@@ -64,8 +59,6 @@ public class IngotStackSystem extends BaseComponentSystem {
     @In
     private BlockEntityRegistry blockEntityRegistry;
     @In
-    private InventoryManager inventoryManager;
-    @In
     private LocalPlayer localPlayer;
 
     @ReceiveEvent(priority = EventPriority.PRIORITY_HIGH)
@@ -86,8 +79,11 @@ public class IngotStackSystem extends BaseComponentSystem {
         if (stackComponent != null && stackComponent.ingots < MAX_INGOTS) {
             EntityRef stackEntity = event.getTarget();
             instigator.send(new PlaySoundEvent(Assets.getSound("engine:PlaceBlock").get(), 0.5f));
-            SelectedInventorySlotComponent selectedSlot = instigator.getComponent(SelectedInventorySlotComponent.class);
-            inventoryManager.moveItem(instigator, instigator, selectedSlot.slot, stackEntity, 0, 1);
+
+            MoveItemEvent moveEvent = new MoveItemEvent(instigator, stackEntity);
+            moveEvent.setMoveSelectedItem(1);
+            instigator.send(moveEvent);
+            updateStackSize(-1, stackEntity, stackEntity.getComponent(IngotStackComponent.class));
 
         } else if (canPlaceBlock(blockPos, targetPos)) {
             Block newStackBlock = blockManager.getBlockFamily(LAYER_1_URI)
@@ -95,9 +91,14 @@ public class IngotStackSystem extends BaseComponentSystem {
             PlaceBlocks placeNewIngotStack = new PlaceBlocks(targetPos, newStackBlock, instigator);
             worldProvider.getWorldEntity().send(placeNewIngotStack);
             instigator.send(new PlaySoundEvent(Assets.getSound("engine:PlaceBlock").get(), 0.5f));
-            inventoryManager.moveItem(instigator, instigator, findSlot(instigator), blockEntityRegistry.getBlockEntityAt(targetPos), 0, 1);
-            updateIngotStack(targetPos, 1, instigator);
+
+            EntityRef stackEntity = blockEntityRegistry.getBlockEntityAt(targetPos);
+            MoveItemEvent moveEvent = new MoveItemEvent(instigator, stackEntity);
+            moveEvent.setMoveByComponent(1, IngotComponent.class);
+            instigator.send(moveEvent);
+            updateStackSize(-1, stackEntity, stackEntity.getComponent(IngotStackComponent.class));
         }
+
         event.consume();
     }
 
@@ -105,41 +106,26 @@ public class IngotStackSystem extends BaseComponentSystem {
     public void onLeftClick(AttackEvent event, EntityRef stackEntity, IngotStackComponent stackComponent) {
         EntityRef instigator = event.getInstigator();
         if (stackComponent.ingots > 0) {
-            inventoryManager.moveItem(stackEntity, instigator, 0, instigator, findSlot(instigator), 1);
+            MoveItemEvent moveEvent = new MoveItemEvent(stackEntity, instigator);
+            moveEvent.setMoveFirstOption(-1);
+            instigator.send(moveEvent);
             instigator.send(new PlaySoundEvent(Assets.getSound("engine:Loot").get(), 0.5f));
+            updateStackSize(-1, stackEntity, stackEntity.getComponent(IngotStackComponent.class));
         }
         event.consume();
     }
 
     // for real-time updates to the stack
-    @ReceiveEvent
-    public void onStackSizeChange(InventorySlotStackSizeChangedEvent event, EntityRef stackEntity, IngotStackComponent stackComponent) {
+    private void updateStackSize(int amount, EntityRef stackEntity, IngotStackComponent stackComponent) {
         EntityRef instigator = localPlayer.getCharacterEntity();
         LocationComponent locationComponent = stackEntity.getComponent(LocationComponent.class);
         Vector3i pos = new Vector3i(locationComponent.getWorldPosition());
-        if (event.getNewSize() > MAX_INGOTS) {
-            inventoryManager.moveItem(stackEntity, instigator, 0, instigator, findSlot(instigator), event.getNewSize() - MAX_INGOTS);
+        if (stackComponent.ingots + amount > MAX_INGOTS) {
+            MoveItemEvent moveEvent = new MoveItemEvent(stackEntity, instigator);
+            moveEvent.setMoveFirstOption(stackComponent.ingots + amount - MAX_INGOTS);
+            instigator.send(moveEvent);
         }
-        updateIngotStack(pos, event.getNewSize(), instigator);
-    }
-
-    @ReceiveEvent
-    public void onItemPut(BeforeItemPutInInventory event, EntityRef stackEntity, IngotStackComponent stackComponent) {
-        EntityRef item = event.getItem();
-        // only ingot items allowed in the ingot stack
-        if (!item.hasComponent(IngotComponent.class)) {
-            event.consume();
-            return;
-        }
-    }
-
-    @ReceiveEvent
-    public void onEmpty(InventorySlotChangedEvent event, EntityRef stackEntity, IngotStackComponent stackComponent) {
-        LocationComponent locationComponent = stackEntity.getComponent(LocationComponent.class);
-        Vector3i pos = new Vector3i(locationComponent.getWorldPosition());
-        if (event.getOldItem().hasComponent(IngotComponent.class) && event.getNewItem() == EntityRef.NULL) {
-            updateIngotStack(pos, 0, localPlayer.getCharacterEntity());
-        }
+        updateIngotStack(pos, Math.min(stackComponent.ingots + amount, MAX_INGOTS), instigator);
     }
 
     private void updateIngotStack(Vector3i stackPos, int ingots, EntityRef instigator) {
@@ -192,23 +178,5 @@ public class IngotStackSystem extends BaseComponentSystem {
             return false;
         }
         return true;
-    }
-
-    private int findSlot(EntityRef entity) {
-        SelectedInventorySlotComponent selectedSlot = entity.getComponent(SelectedInventorySlotComponent.class);
-        if (inventoryManager.getItemInSlot(entity, selectedSlot.slot) == EntityRef.NULL
-                || inventoryManager.getItemInSlot(entity, selectedSlot.slot).hasComponent(IngotComponent.class)) {
-            return selectedSlot.slot;
-        }
-        int emptySlot = -1;
-        int slotCount = InventoryUtils.getSlotCount(entity);
-        for (int i = 0; i < slotCount; i++) {
-            if (InventoryUtils.getItemAt(entity, i).hasComponent(IngotComponent.class)) {
-                return i;
-            } else if (InventoryUtils.getItemAt(entity, i) == EntityRef.NULL && emptySlot == -1) {
-                emptySlot = i;
-            }
-        }
-        return emptySlot;
     }
 }
